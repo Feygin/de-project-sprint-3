@@ -3,10 +3,7 @@
     DATA_FOLDER, SQL_FOLDER которые хранят пути к sql скриптам
     и папке, куда выгружаем файлы s3.
     Перед запуском DAG необходимо добавить поля status в таблицы и
-    создать материализованное представление для витрины, файлы:
-    alter_schema.sql
-    mart.f_customer_retention_create.sql
-    Витрина обновляется через DAG.
+    создать таблицу для витрины, файл: alter_schema.sql
 """
 
 import time
@@ -15,6 +12,7 @@ import json
 import pandas as pd
 import os
 
+from jinja2 import Template
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python_operator import PythonOperator, BranchPythonOperator
@@ -32,8 +30,8 @@ POSTGRES_CONN_ID = 'postgresql_de'
 NICKNAME = 'feyginalex'
 COHORT = '12'
 
-DATA_FOLDER = '/lessons/dags/data'
-SQL_FOLDER  = '/lessons/dags/sql'
+DATA_FOLDER = '/lessons/dags/src/dags/data'
+SQL_FOLDER  = '/lessons/dags/migrations'
 
 HEADERS = {
     'X-Nickname': NICKNAME,
@@ -48,7 +46,7 @@ ARGS = {
     'email': ['student@example.com'],
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': 0
+    'retries': 2
 }
 
 BUSINESS_DT = '{{ ds }}'
@@ -113,21 +111,25 @@ def load_data_from_s3(filename, date, ti):
     print(local_full_path)
     response = requests.get(s3_filename)
     response.raise_for_status()
-    open(f"{local_full_path}", "wb").write(response.content)
+    open(local_full_path, "wb").write(response.content)
     print(response.content)
     ti.xcom_push(key='file_path', value=local_full_path)
 
 def upload_data_to_staging(date, pg_table, pg_schema, ti):
     filename = ti.xcom_pull(key='file_path')
-
-    df = pd.read_csv(filename)
-    df=df.drop('id', axis=1)
+    df = pd.read_csv(filename, index_col=0)
     df=df.drop_duplicates(subset=['uniq_id'])
 
     if 'status' not in df.columns:
         df['status'] = 'shipped'
 
     postgres_hook = PostgresHook(POSTGRES_CONN_ID)
+
+    with open(f'{SQL_FOLDER}/staging.clear_current_data.sql') as f: # читаем содержимое шаблона
+        sql_template = f.read()
+    
+    sql = Template(sql_template).render(ds=date) # рендерим jinja template  
+    postgres_hook.run(sql = sql) # удаляем данные за текущий период в staging
     
     engine = postgres_hook.get_sqlalchemy_engine()
     row_count = df.to_sql(pg_table, engine, schema=pg_schema, if_exists='append', index=False)
@@ -139,8 +141,12 @@ with DAG(
         'load_sales_mart',
         default_args=ARGS,
         catchup=True,
+        # start_date=datetime.today() - timedelta(days=7),
+        # end_date=datetime.today() - timedelta(days=6),
         start_date=datetime.today() - timedelta(days=7),
         end_date=datetime.today() - timedelta(days=1),
+        template_searchpath = SQL_FOLDER,
+        max_active_runs = 1
 ) as dag:
 
     generate_report = PythonOperator(
@@ -162,65 +168,44 @@ with DAG(
         op_kwargs={'date': BUSINESS_DT,
                    'filename': 'user_order_log_inc.csv'})
 
-    #очищаем данные staging за текущий день
-    #для выполнения условия идемпотентности
-    clear_staging = PostgresOperator(
-        task_id='clear_staging',
-        postgres_conn_id=POSTGRES_CONN_ID,
-        sql='sql/staging.clear_current_data.sql',
-        parameters={"date": {BUSINESS_DT}}
-    )
-
     load_staging = PythonOperator(
         task_id='upload_data_to_staging',   
         python_callable=upload_data_to_staging,
         op_kwargs={'date': BUSINESS_DT,
                    'pg_table': 'user_order_log', 
                    'pg_schema': 'staging'})
-
-    update_d_item_table = PostgresOperator(
-        task_id='update_d_item',
-        postgres_conn_id=POSTGRES_CONN_ID,
-        sql="sql/mart.d_item.sql",
-        parameters={"date": {BUSINESS_DT}} 
-    )
-
-    update_d_customer_table = PostgresOperator(
-        task_id='update_d_customer',
-        postgres_conn_id=POSTGRES_CONN_ID,
-        sql="sql/mart.d_customer.sql",
-        parameters={"date": {BUSINESS_DT}} 
-    )
-
-    update_d_city_table = PostgresOperator(
-        task_id='update_d_city',
-        postgres_conn_id=POSTGRES_CONN_ID,
-        sql="sql/mart.d_city.sql",
-        parameters={"date": {BUSINESS_DT}} 
-    )
+    
+    dimension_tasks = list()
+    for i in ['d_item', 'd_customer', 'd_city']:
+        dimension_tasks.append(PostgresOperator(
+            task_id = f'update_{i}',
+            postgres_conn_id = POSTGRES_CONN_ID,
+            sql = f'/migrations/mart.{i}.sql',
+            parameters={"date": {BUSINESS_DT}} 
+            )
+        )
 
     update_f_sales = PostgresOperator(
         task_id='update_f_sales',
         postgres_conn_id=POSTGRES_CONN_ID,
-        sql="sql/mart.f_sales.sql",
+        sql= f'/migrations/mart.f_sales.sql',
         parameters={"date": {BUSINESS_DT}} 
     )
 
-    # обновляем витрину
     update_f_customer_retention = PostgresOperator(
         task_id='update_f_customer_retention',
         postgres_conn_id=POSTGRES_CONN_ID,
-        sql='sql/mart.f_customer_retention_refresh.sql'
+        sql= f'/migrations/mart.f_customer_retention_update.sql',
+        parameters={"date": {BUSINESS_DT}} 
     )
 
     (       
-            generate_report
-            >> get_report
-            >> get_increment
-            >> download_data
-            >> clear_staging
-            >> load_staging
-            >> [update_d_item_table, update_d_city_table, update_d_customer_table]
-            >> update_f_sales
-            >> update_f_customer_retention
+        generate_report
+        >> get_report
+        >> get_increment
+        >> download_data
+        >> load_staging
+        >> dimension_tasks
+        >> update_f_sales
+        >> update_f_customer_retention
     )
